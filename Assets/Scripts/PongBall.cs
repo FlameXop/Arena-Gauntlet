@@ -5,8 +5,17 @@ public enum RallyPhase
     ServerReady,              // 1. Floats in front of Server until [X] or [Y] is pressed
     ServeGoingToServerTable,  // 2. Travels DOWN onto Server's own table side first
     CrossingToReceiver,       // 3. Bounces UP in a clear arc over the net to Receiver's table side
-    ReceiverReadyToHit,       // 4. Bounces ONCE on Receiver's table and arcs toward Receiver's paddle
+    ReceiverReadyToHit,       // 4. Bounces ONCE on Receiver's table -> Must be hit BEFORE 2nd bounce or passing paddle!
     PointEnded                // 5. Point over -> Ball bounces naturally for 1.4s before next serve
+}
+
+public enum SpinCategory
+{
+    Flat,
+    SideSpinLeft,
+    SideSpinRight,
+    CounterSpin,
+    OffSpin
 }
 
 [RequireComponent(typeof(Rigidbody), typeof(Collider))]
@@ -16,23 +25,21 @@ public class PongBall : MonoBehaviour
     public Transform player1TargetCenter;
     public Transform player2TargetCenter;
 
-    [Header("1. Visual Arc Heights (Guaranteed Net Clearance!)")]
-    [Tooltip("Arc height above the net for [X] Normal Shot")]
+    [Header("1. Visual Arc Heights (Fully Inspector Editable!)")]
     public float normalArcAboveNet = 0.60f;
-    [Tooltip("Arc height above the net for [Y] Smash Shot")]
     public float smashArcAboveNet = 0.34f;
-    [Tooltip("How high the ball pops up after bouncing on Receiver's side")]
-    public float receiverBouncePopHeight = 0.48f;
+    public float receiverBouncePopHeight = 0.44f;
 
-    [Header("2. Flight Durations (Seconds) - Higher = Slower")]
-    [Tooltip("Time for serve to hit server's own side")]
+    [Header("2. Flight Durations in Seconds (Fully Inspector Editable!)")]
     public float serveDownToOwnTableTime = 0.30f;
-    [Tooltip("[X] Normal Shot: Slower, comfortable rally speed")]
     public float normalCrossNetTime = 0.74f;
-    [Tooltip("[Y] Smash Shot: Equal to the previous [X] speed!")]
     public float smashCrossNetTime = 0.52f;
-    [Tooltip("Time window after bounce for Receiver to move and hit")]
-    public float receiverPopUpWindowTime = 0.78f;
+    public float receiverPopUpWindowTime = 0.68f;
+
+    [Header("3. Spin Mechanic & Spin Meter HUD")]
+    public bool showSpinMeterHUD = true;
+    [Range(0.15f, 0.65f)] public float maxAirSpinCurve = 0.36f;
+    [Range(0.10f, 0.50f)] public float maxBounceSpinKick = 0.28f;
 
     [Header("Debug")]
     public bool enableDebugLogs = true;
@@ -42,10 +49,13 @@ public class PongBall : MonoBehaviour
     public bool LastHitByPlayer1 { get; private set; } = true;
     public bool IsPlayer1Receiver => !LastHitByPlayer1;
 
+    public float CurrentSpinMeter { get; private set; } = 0f;
+    public SpinCategory CurrentSpinType { get; private set; } = SpinCategory.Flat;
+    public string CurrentSpinLabel { get; private set; } = "FLAT (0%)";
+
     private Rigidbody rb;
     private Collider ballCollider;
 
-    // Exact Table Geometry cached from Scene
     private Vector3 p1RacketHome;
     private Vector3 p2RacketHome;
     private Vector3 tableCenterPos;
@@ -55,7 +65,6 @@ public class PongBall : MonoBehaviour
     private float netTopY;
     private float halfTableDist;
 
-    // Active Flight Segment variables
     private Vector3 flightStartPos;
     private Vector3 flightEndPos;
     private float flightPeakY;
@@ -63,12 +72,10 @@ public class PongBall : MonoBehaviour
     private float flightElapsed;
     private bool flightIsSmash;
 
-    // Saved target for 2nd half of Serve (after bouncing on Server's own table)
     private Vector3 pendingServeReceiverSpot;
     private float pendingServeSpeedMult = 1f;
     private bool pendingServeIsSmash = false;
 
-    // Post-point natural bounce velocity
     private Vector3 postPointVelocity;
 
     private void Awake()
@@ -76,16 +83,7 @@ public class PongBall : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         ballCollider = GetComponent<Collider>();
 
-        // Force-apply the new slower speeds ([Y] = old [X] speed, [X] = slower)
-        normalArcAboveNet = 0.60f;
-        smashArcAboveNet = 0.34f;
-        receiverBouncePopHeight = 0.48f;
-
-        serveDownToOwnTableTime = 0.30f;
-        normalCrossNetTime = 0.74f;      // Slower X shot
-        smashCrossNetTime = 0.52f;       // Y shot is now the old X speed!
-        receiverPopUpWindowTime = 0.78f; // Plenty of time to move left/right to the ball
-
+        // NO OVERRIDES HERE! Inspector values on 'ball' are preserved!
         rb.useGravity = false;
         rb.isKinematic = true;
         if (ballCollider != null) ballCollider.enabled = false;
@@ -196,13 +194,13 @@ public class PongBall : MonoBehaviour
     {
         if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing) return;
 
-        // PHASE 1: ServerReady -> Ball floats in front of Server's paddle
-        if (CurrentPhase == RallyPhase.ServerReady)
+        if (CurrentPhase != RallyPhase.ServerReady && Mathf.Abs(CurrentSpinMeter) > 0.05f)
         {
-            return;
+            transform.Rotate(Vector3.up, CurrentSpinMeter * 720f * Time.deltaTime, Space.World);
         }
 
-        // PHASE 5: PointEnded -> Ball bounces/rolls naturally for 1.4s until next serve
+        if (CurrentPhase == RallyPhase.ServerReady) return;
+
         if (CurrentPhase == RallyPhase.PointEnded)
         {
             postPointVelocity.y -= 9.81f * Time.deltaTime;
@@ -215,18 +213,41 @@ public class PongBall : MonoBehaviour
             if (distFromCenter < halfTableDist * 2.2f && transform.position.y <= tableSurfaceY + 0.03f && postPointVelocity.y < 0f)
             {
                 transform.position = new Vector3(transform.position.x, tableSurfaceY + 0.03f, transform.position.z);
-                postPointVelocity.y = Mathf.Abs(postPointVelocity.y) * 0.55f;
-                postPointVelocity.x *= 0.75f;
-                postPointVelocity.z *= 0.75f;
+                postPointVelocity.y = Mathf.Abs(postPointVelocity.y) * 0.52f;
+                postPointVelocity.x *= 0.72f;
+                postPointVelocity.z *= 0.72f;
             }
             return;
         }
 
-        // ADVANCE ACTIVE PARABOLIC FLIGHT SEGMENT
         flightElapsed += Time.deltaTime;
         float t = Mathf.Clamp01(flightElapsed / Mathf.Max(0.05f, flightDuration));
 
         transform.position = EvaluateFlightPosition(t);
+
+        if (CurrentPhase == RallyPhase.ReceiverReadyToHit)
+        {
+            Vector3 receiverHome = IsPlayer1Receiver ? p1RacketHome : p2RacketHome;
+            Vector3 receiverForward = IsPlayer1Receiver ? axisP1ToP2 : -axisP1ToP2;
+
+            float distInFrontOfReceiverHome = Vector3.Dot(transform.position - receiverHome, receiverForward);
+
+            if (distInFrontOfReceiverHome < -0.10f)
+            {
+                TriggerReceiverFault(false);
+                return;
+            }
+
+            if (t >= 0.72f && transform.position.y <= tableSurfaceY + 0.045f)
+            {
+                float distFromCenterAlongTable = Mathf.Abs(Vector3.Dot(transform.position - tableCenterPos, axisP1ToP2));
+                if (distFromCenterAlongTable <= halfTableDist * 1.95f)
+                {
+                    TriggerReceiverFault(true);
+                    return;
+                }
+            }
+        }
 
         if (t >= 1f)
         {
@@ -237,6 +258,12 @@ public class PongBall : MonoBehaviour
     private Vector3 EvaluateFlightPosition(float t)
     {
         Vector3 posXZ = Vector3.Lerp(flightStartPos, flightEndPos, t);
+
+        if (CurrentPhase == RallyPhase.CrossingToReceiver && Mathf.Abs(CurrentSpinMeter) > 0.01f)
+        {
+            float curveArc = 4f * t * (1f - t);
+            posXZ += axisLeftToRight * (CurrentSpinMeter * maxAirSpinCurve * curveArc);
+        }
 
         float y;
         if (CurrentPhase == RallyPhase.ServeGoingToServerTable)
@@ -255,38 +282,72 @@ public class PongBall : MonoBehaviour
 
     private void OnFlightSegmentCompleted()
     {
-        // 1. Serve bounced on Server's own table -> Arc over the net
         if (CurrentPhase == RallyPhase.ServeGoingToServerTable)
         {
             TriggerServeFirstBounceOverNet();
             return;
         }
 
-        // 2. Crossed net and landed on Receiver's table -> Pop up along that lane toward Receiver's baseline
         if (CurrentPhase == RallyPhase.CrossingToReceiver)
         {
             TriggerReceiverTableBounce();
             return;
         }
 
-        // 3. Receiver failed to reach & hit the ball before the pop-up arc finished -> Point to Hitter!
         if (CurrentPhase == RallyPhase.ReceiverReadyToHit)
         {
-            string hitter = LastHitByPlayer1 ? "P1" : "P2/AI";
-            string receiver = LastHitByPlayer1 ? "P2/AI" : "P1";
-
-            Vector3 horizDir = (flightEndPos - flightStartPos) / Mathf.Max(0.1f, flightDuration);
-            postPointVelocity = new Vector3(horizDir.x * 0.65f, -2.0f, horizDir.z * 0.65f);
-
-            EndPoint(LastHitByPlayer1, $"<color=#00FF88>POINT {hitter}!</color> ({receiver} missed return)");
+            TriggerReceiverFault(true);
         }
     }
 
-    // STATE 1: Hold ball in front of Server
+    private void TriggerReceiverFault(bool isDoubleBounce)
+    {
+        if (CurrentPhase == RallyPhase.PointEnded) return;
+
+        string hitter = LastHitByPlayer1 ? "P1" : "P2/AI";
+        string receiver = LastHitByPlayer1 ? "P2/AI" : "P1";
+
+        Vector3 horizDir = (flightEndPos - flightStartPos) / Mathf.Max(0.1f, flightDuration);
+        postPointVelocity = new Vector3(horizDir.x * 0.65f, isDoubleBounce ? 1.85f : -1.8f, horizDir.z * 0.65f);
+
+        string reason = isDoubleBounce
+            ? $"<color=#00FF88>DOUBLE BOUNCE FAULT!</color> (Point {hitter} - {receiver} missed)"
+            : $"<color=#00FF88>POINT {hitter}!</color> (Ball passed {receiver}'s racket)";
+
+        EndPoint(LastHitByPlayer1, reason);
+    }
+
+    private void SetActiveSpinState(float normalizedSpin, SpinCategory category)
+    {
+        CurrentSpinMeter = Mathf.Clamp(normalizedSpin, -1f, 1f);
+        CurrentSpinType = category;
+
+        int pct = Mathf.RoundToInt(Mathf.Abs(CurrentSpinMeter) * 100f);
+        string dirTag = CurrentSpinMeter < -0.08f ? "LEFT ◄" : (CurrentSpinMeter > 0.08f ? "► RIGHT" : "CENTER");
+
+        switch (category)
+        {
+            case SpinCategory.CounterSpin:
+                CurrentSpinLabel = $"COUNTER-SPIN {dirTag} ({pct}%)";
+                break;
+            case SpinCategory.OffSpin:
+                CurrentSpinLabel = $"OFF-SPIN {dirTag} ({pct}%)";
+                break;
+            case SpinCategory.SideSpinLeft:
+            case SpinCategory.SideSpinRight:
+                CurrentSpinLabel = $"SIDE-SPIN {dirTag} ({pct}%)";
+                break;
+            default:
+                CurrentSpinLabel = $"FLAT DRIVE ({pct}%)";
+                break;
+        }
+    }
+
     public void SetupServe(bool isPlayer1Serve, Vector3 holdWorldPosition)
     {
         IsPlayer1Serving = isPlayer1Serve;
         CurrentPhase = RallyPhase.ServerReady;
+        SetActiveSpinState(0f, SpinCategory.Flat);
 
         rb.isKinematic = true;
         if (ballCollider != null) ballCollider.enabled = false;
@@ -294,13 +355,13 @@ public class PongBall : MonoBehaviour
         transform.position = holdWorldPosition;
     }
 
-    // STATE 1 -> STATE 2 (SERVE): Server hits ball DOWN onto their own side first
     public void ExecuteServerDownwardHit(
         Vector3 ownTableBounceSpot,
         Vector3 receiverTableTarget,
         float speedMultiplier,
         bool isSmash,
-        Vector3 spinVector,
+        float spinNormalized,
+        SpinCategory spinCategory,
         bool hitByP1)
     {
         CurrentPhase = RallyPhase.ServeGoingToServerTable;
@@ -310,21 +371,21 @@ public class PongBall : MonoBehaviour
         pendingServeSpeedMult = Mathf.Clamp(speedMultiplier, 0.85f, 1.25f);
         pendingServeIsSmash = isSmash;
 
+        SetActiveSpinState(spinNormalized, spinCategory);
+
         flightStartPos = transform.position;
         flightEndPos = new Vector3(ownTableBounceSpot.x, tableSurfaceY + 0.03f, ownTableBounceSpot.z);
         flightPeakY = Mathf.Max(flightStartPos.y, flightEndPos.y);
 
-        // If Y Smash serve, slightly faster; if X Normal serve, slower
         float serveTime = isSmash ? (serveDownToOwnTableTime * 0.78f) : serveDownToOwnTableTime;
         flightDuration = serveTime / pendingServeSpeedMult;
         flightElapsed = 0f;
         flightIsSmash = isSmash;
 
         if (enableDebugLogs)
-            Debug.Log($"<color=#00E5FF>[1. SERVE DOWN]</color> {(hitByP1 ? "P1" : "P2/AI")} served to own side: {flightEndPos}");
+            Debug.Log($"<color=#00E5FF>[1. SERVE DOWN]</color> {(hitByP1 ? "P1" : "P2/AI")} served ({CurrentSpinLabel})");
     }
 
-    // STATE 2 -> STATE 3 (1ST SERVE BOUNCE): Bounces off Server's side -> High arc over net!
     private void TriggerServeFirstBounceOverNet()
     {
         CurrentPhase = RallyPhase.CrossingToReceiver;
@@ -339,12 +400,8 @@ public class PongBall : MonoBehaviour
         flightDuration = baseTime / pendingServeSpeedMult;
         flightElapsed = 0f;
         flightIsSmash = pendingServeIsSmash;
-
-        if (enableDebugLogs)
-            Debug.Log($"<color=#55FF55>[2. SERVE BOUNCED]</color> Crossing net to {flightEndPos}");
     }
 
-    // STATE 3 -> STATE 4 (BOUNCE ON RECEIVER'S TABLE): Pops up along the bounce lane so Receiver must move to it!
     private void TriggerReceiverTableBounce()
     {
         CurrentPhase = RallyPhase.ReceiverReadyToHit;
@@ -353,34 +410,34 @@ public class PongBall : MonoBehaviour
 
         Vector3 dirToReceiver = IsPlayer1Receiver ? -axisP1ToP2 : axisP1ToP2;
         Vector3 lateralOffset = Vector3.Project(flightStartPos - tableCenterPos, axisLeftToRight);
+        Vector3 spinBounceKick = axisLeftToRight * (CurrentSpinMeter * maxBounceSpinKick);
 
-        // Carries slight outward angle (1.12x) after the bounce like a real ping pong ball!
-        Vector3 strikeLinePos = tableCenterPos
-            + (dirToReceiver * (halfTableDist * 1.95f))
-            + (lateralOffset * 1.12f);
+        Vector3 secondBounceSpot = tableCenterPos
+            + (dirToReceiver * (halfTableDist * 1.88f))
+            + (lateralOffset * 1.10f)
+            + spinBounceKick;
 
-        strikeLinePos.y = tableSurfaceY + 0.12f;
+        secondBounceSpot.y = tableSurfaceY + 0.03f;
 
-        flightEndPos = strikeLinePos;
+        flightEndPos = secondBounceSpot;
         flightPeakY = tableSurfaceY + receiverBouncePopHeight;
         flightDuration = flightIsSmash ? (receiverPopUpWindowTime * 0.85f) : receiverPopUpWindowTime;
         flightElapsed = 0f;
-
-        if (enableDebugLogs)
-            Debug.Log($"<color=#00FF88>[3. BOUNCED ON RECEIVER TABLE]</color> Receiver must move to lane: {strikeLinePos}");
     }
 
-    // STATE 4 -> STATE 3 (RALLY RETURN): Receiver hits ball over the net to the calculated target zone!
     public void ExecuteReceiverRallyReturn(
         Vector3 opponentTableTarget,
         float speedMultiplier,
         bool isSmash,
-        Vector3 spinVector,
+        float spinNormalized,
+        SpinCategory spinCategory,
         bool hitByP1,
         string shotLabel)
     {
         CurrentPhase = RallyPhase.CrossingToReceiver;
         LastHitByPlayer1 = hitByP1;
+
+        SetActiveSpinState(spinNormalized, spinCategory);
 
         float clampedSpeed = Mathf.Clamp(speedMultiplier, 0.85f, 1.25f);
 
@@ -394,9 +451,6 @@ public class PongBall : MonoBehaviour
         flightDuration = baseTime / clampedSpeed;
         flightElapsed = 0f;
         flightIsSmash = isSmash;
-
-        if (enableDebugLogs)
-            Debug.Log($"<color=#00E5FF>[RALLY RETURN - {shotLabel}]</color> {(hitByP1 ? "P1" : "P2/AI")} returned to {flightEndPos}!");
     }
 
     private void EndPoint(bool player1Scored, string banner)
@@ -413,8 +467,51 @@ public class PongBall : MonoBehaviour
     public void ResetBallToCenter()
     {
         CurrentPhase = RallyPhase.ServerReady;
+        SetActiveSpinState(0f, SpinCategory.Flat);
         rb.isKinematic = true;
         if (ballCollider != null) ballCollider.enabled = false;
         transform.position = tableCenterPos + Vector3.up * 0.35f;
+    }
+
+    private void OnGUI()
+    {
+        if (!showSpinMeterHUD) return;
+        if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing) return;
+
+        float barWidth = 280f;
+        float barHeight = 22f;
+        float x = (Screen.width - barWidth) * 0.5f;
+        float y = Screen.height - 68f;
+
+        GUI.color = new Color(0f, 0f, 0f, 0.75f);
+        GUI.Box(new Rect(x - 10f, y - 26f, barWidth + 20f, barHeight + 36f), "");
+
+        GUIStyle labelStyle = new GUIStyle(GUI.skin.label)
+        {
+            alignment = TextAnchor.MiddleCenter,
+            fontStyle = FontStyle.Bold,
+            fontSize = 13
+        };
+        GUI.color = CurrentSpinType == SpinCategory.CounterSpin ? new Color(1f, 0.45f, 0.2f)
+                  : CurrentSpinType == SpinCategory.OffSpin ? new Color(0.75f, 0.4f, 1f)
+                  : new Color(0f, 0.9f, 1f);
+        GUI.Label(new Rect(x - 10f, y - 24f, barWidth + 20f, 22f), $"SPIN METER: {CurrentSpinLabel}", labelStyle);
+
+        GUI.color = new Color(0.2f, 0.2f, 0.25f, 0.95f);
+        GUI.DrawTexture(new Rect(x, y, barWidth, barHeight), Texture2D.whiteTexture);
+
+        float centerX = x + (barWidth * 0.5f);
+        GUI.color = Color.white;
+        GUI.DrawTexture(new Rect(centerX - 1f, y - 2f, 2f, barHeight + 4f), Texture2D.whiteTexture);
+
+        float fillWidth = (barWidth * 0.5f) * Mathf.Abs(CurrentSpinMeter);
+        if (fillWidth > 1f)
+        {
+            GUI.color = CurrentSpinMeter < 0f ? new Color(0f, 0.85f, 1f, 0.9f) : new Color(1f, 0.65f, 0f, 0.9f);
+            float fillX = CurrentSpinMeter < 0f ? (centerX - fillWidth) : centerX;
+            GUI.DrawTexture(new Rect(fillX, y + 3f, fillWidth, barHeight - 6f), Texture2D.whiteTexture);
+        }
+
+        GUI.color = Color.white;
     }
 }
