@@ -5,7 +5,7 @@ public enum RallyPhase
     ServerReady,              // 1. Floats in front of Server until [X] or [Y] is pressed
     ServeGoingToServerTable,  // 2. Travels DOWN onto Server's own table side first
     CrossingToReceiver,       // 3. Bounces UP in a clear arc over the net to Receiver's table side
-    ReceiverReadyToHit,       // 4. Bounces ONCE on Receiver's table -> Must be hit BEFORE 2nd bounce or passing paddle!
+    ReceiverReadyToHit,       // 4. Bounces ONCE on Receiver's table and arcs through Receiver's BoxCollider zone!
     PointEnded                // 5. Point over -> Ball bounces naturally for 1.4s before next serve
 }
 
@@ -28,18 +28,18 @@ public class PongBall : MonoBehaviour
     [Header("1. Visual Arc Heights (Fully Inspector Editable!)")]
     public float normalArcAboveNet = 0.60f;
     public float smashArcAboveNet = 0.34f;
-    public float receiverBouncePopHeight = 0.44f;
+    public float receiverBouncePopHeight = 0.48f;
 
     [Header("2. Flight Durations in Seconds (Fully Inspector Editable!)")]
     public float serveDownToOwnTableTime = 0.30f;
     public float normalCrossNetTime = 0.74f;
     public float smashCrossNetTime = 0.52f;
-    public float receiverPopUpWindowTime = 0.68f;
+    public float receiverPopUpWindowTime = 0.75f;
 
     [Header("3. Spin Mechanic & Spin Meter HUD")]
     public bool showSpinMeterHUD = true;
-    [Range(0.15f, 0.65f)] public float maxAirSpinCurve = 0.36f;
-    [Range(0.10f, 0.50f)] public float maxBounceSpinKick = 0.28f;
+    [Range(0.10f, 0.55f)] public float maxAirSpinCurve = 0.28f;
+    [Range(0.05f, 0.40f)] public float maxBounceSpinKick = 0.20f;
 
     [Header("Debug")]
     public bool enableDebugLogs = true;
@@ -55,6 +55,9 @@ public class PongBall : MonoBehaviour
 
     private Rigidbody rb;
     private Collider ballCollider;
+
+    private RacketController p1RacketRef;
+    private RacketController p2RacketRef;
 
     private Vector3 p1RacketHome;
     private Vector3 p2RacketHome;
@@ -83,7 +86,6 @@ public class PongBall : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         ballCollider = GetComponent<Collider>();
 
-        // NO OVERRIDES HERE! Inspector values on 'ball' are preserved!
         rb.useGravity = false;
         rb.isKinematic = true;
         if (ballCollider != null) ballCollider.enabled = false;
@@ -98,9 +100,9 @@ public class PongBall : MonoBehaviour
         RacketController[] rackets = FindObjectsByType<RacketController>(FindObjectsSortMode.None);
         if (rackets.Length >= 2)
         {
-            RacketController p1 = rackets[0].isPlayer1 ? rackets[0] : rackets[1];
-            RacketController p2 = !rackets[0].isPlayer1 ? rackets[0] : rackets[1];
-            ConfigureFallbackTablePoints(p1.transform.position, p2.transform.position);
+            p1RacketRef = rackets[0].isPlayer1 ? rackets[0] : rackets[1];
+            p2RacketRef = !rackets[0].isPlayer1 ? rackets[0] : rackets[1];
+            ConfigureFallbackTablePoints(p1RacketRef.transform.position, p2RacketRef.transform.position);
         }
     }
 
@@ -168,22 +170,32 @@ public class PongBall : MonoBehaviour
         halfTableDist = Mathf.Max(0.6f, totalRacketDist * 0.24f);
     }
 
+    // Guaranteed to return the table half closest to Player 1's racket!
     public Vector3 GetPlayer1TableTarget()
     {
-        if (player1TargetCenter != null)
+        Vector3 mathP1 = tableCenterPos - (axisP1ToP2 * halfTableDist);
+        if (player1TargetCenter != null && player2TargetCenter != null)
         {
-            return new Vector3(player1TargetCenter.position.x, tableSurfaceY, player1TargetCenter.position.z);
+            float d1 = Vector3.Distance(p1RacketHome, player1TargetCenter.position);
+            float d2 = Vector3.Distance(p1RacketHome, player2TargetCenter.position);
+            Transform closerToP1 = d1 <= d2 ? player1TargetCenter : player2TargetCenter;
+            return new Vector3(closerToP1.position.x, tableSurfaceY, closerToP1.position.z);
         }
-        return tableCenterPos - (axisP1ToP2 * halfTableDist);
+        return mathP1;
     }
 
+    // Guaranteed to return the table half closest to Player 2 / AI's racket!
     public Vector3 GetPlayer2TableTarget()
     {
-        if (player2TargetCenter != null)
+        Vector3 mathP2 = tableCenterPos + (axisP1ToP2 * halfTableDist);
+        if (player1TargetCenter != null && player2TargetCenter != null)
         {
-            return new Vector3(player2TargetCenter.position.x, tableSurfaceY, player2TargetCenter.position.z);
+            float d1 = Vector3.Distance(p2RacketHome, player1TargetCenter.position);
+            float d2 = Vector3.Distance(p2RacketHome, player2TargetCenter.position);
+            Transform closerToP2 = d2 <= d1 ? player2TargetCenter : player1TargetCenter;
+            return new Vector3(closerToP2.position.x, tableSurfaceY, closerToP2.position.z);
         }
-        return tableCenterPos + (axisP1ToP2 * halfTableDist);
+        return mathP2;
     }
 
     public float GetTableSurfaceY() => tableSurfaceY;
@@ -225,6 +237,8 @@ public class PongBall : MonoBehaviour
 
         transform.position = EvaluateFlightPosition(t);
 
+        // Only trigger a fault once the ball has actually passed BEHIND the Receiver's racket plane
+        // or finished its full pop-up window without being returned!
         if (CurrentPhase == RallyPhase.ReceiverReadyToHit)
         {
             Vector3 receiverHome = IsPlayer1Receiver ? p1RacketHome : p2RacketHome;
@@ -232,20 +246,11 @@ public class PongBall : MonoBehaviour
 
             float distInFrontOfReceiverHome = Vector3.Dot(transform.position - receiverHome, receiverForward);
 
-            if (distInFrontOfReceiverHome < -0.10f)
+            // Once the ball has traveled 0.18m past the back of the receiver's home line, they missed it!
+            if (distInFrontOfReceiverHome < -0.18f)
             {
                 TriggerReceiverFault(false);
                 return;
-            }
-
-            if (t >= 0.72f && transform.position.y <= tableSurfaceY + 0.045f)
-            {
-                float distFromCenterAlongTable = Mathf.Abs(Vector3.Dot(transform.position - tableCenterPos, axisP1ToP2));
-                if (distFromCenterAlongTable <= halfTableDist * 1.95f)
-                {
-                    TriggerReceiverFault(true);
-                    return;
-                }
             }
         }
 
@@ -308,10 +313,10 @@ public class PongBall : MonoBehaviour
         string receiver = LastHitByPlayer1 ? "P2/AI" : "P1";
 
         Vector3 horizDir = (flightEndPos - flightStartPos) / Mathf.Max(0.1f, flightDuration);
-        postPointVelocity = new Vector3(horizDir.x * 0.65f, isDoubleBounce ? 1.85f : -1.8f, horizDir.z * 0.65f);
+        postPointVelocity = new Vector3(horizDir.x * 0.65f, isDoubleBounce ? 1.6f : -1.8f, horizDir.z * 0.65f);
 
         string reason = isDoubleBounce
-            ? $"<color=#00FF88>DOUBLE BOUNCE FAULT!</color> (Point {hitter} - {receiver} missed)"
+            ? $"<color=#00FF88>POINT {hitter}!</color> ({receiver} missed return)"
             : $"<color=#00FF88>POINT {hitter}!</color> (Ball passed {receiver}'s racket)";
 
         EndPoint(LastHitByPlayer1, reason);
@@ -383,7 +388,7 @@ public class PongBall : MonoBehaviour
         flightIsSmash = isSmash;
 
         if (enableDebugLogs)
-            Debug.Log($"<color=#00E5FF>[1. SERVE DOWN]</color> {(hitByP1 ? "P1" : "P2/AI")} served ({CurrentSpinLabel})");
+            Debug.Log($"<color=#00E5FF>[1. SERVE DOWN]</color> {(hitByP1 ? "P1" : "P2/AI")} served to own side {flightEndPos} -> Target {pendingServeReceiverSpot}");
     }
 
     private void TriggerServeFirstBounceOverNet()
@@ -402,24 +407,35 @@ public class PongBall : MonoBehaviour
         flightIsSmash = pendingServeIsSmash;
     }
 
+    // =========================================================================================
+    // CRITICAL FIX: Ensures the ball pops up from the table and travels ALL THE WAY through
+    // the Receiver's BoxCollider plane (both Player 1 and AI) at BoxCollider height!
+    // =========================================================================================
     private void TriggerReceiverTableBounce()
     {
         CurrentPhase = RallyPhase.ReceiverReadyToHit;
 
         flightStartPos = flightEndPos;
 
+        Vector3 receiverHome = IsPlayer1Receiver ? p1RacketHome : p2RacketHome;
         Vector3 dirToReceiver = IsPlayer1Receiver ? -axisP1ToP2 : axisP1ToP2;
+
+        // Exact distance from table center to the Receiver's racket home line (plus 0.22m past it)
+        float distCenterToRacket = Mathf.Abs(Vector3.Dot(receiverHome - tableCenterPos, dirToReceiver));
+        float targetReachDist = Mathf.Max(halfTableDist * 2.05f, distCenterToRacket + 0.22f);
+
         Vector3 lateralOffset = Vector3.Project(flightStartPos - tableCenterPos, axisLeftToRight);
         Vector3 spinBounceKick = axisLeftToRight * (CurrentSpinMeter * maxBounceSpinKick);
 
-        Vector3 secondBounceSpot = tableCenterPos
-            + (dirToReceiver * (halfTableDist * 1.88f))
-            + (lateralOffset * 1.10f)
+        Vector3 passThroughRacketSpot = tableCenterPos
+            + (dirToReceiver * targetReachDist)
+            + (lateralOffset * 1.05f)
             + spinBounceKick;
 
-        secondBounceSpot.y = tableSurfaceY + 0.03f;
+        // End at a natural height near the table surface right behind the racket so it passes straight through the BoxCollider!
+        passThroughRacketSpot.y = tableSurfaceY + 0.10f;
 
-        flightEndPos = secondBounceSpot;
+        flightEndPos = passThroughRacketSpot;
         flightPeakY = tableSurfaceY + receiverBouncePopHeight;
         flightDuration = flightIsSmash ? (receiverPopUpWindowTime * 0.85f) : receiverPopUpWindowTime;
         flightElapsed = 0f;
@@ -451,6 +467,9 @@ public class PongBall : MonoBehaviour
         flightDuration = baseTime / clampedSpeed;
         flightElapsed = 0f;
         flightIsSmash = isSmash;
+
+        if (enableDebugLogs)
+            Debug.Log($"<color=#00E5FF>[RALLY RETURN - {shotLabel}]</color> {(hitByP1 ? "P1" : "P2/AI")} returned to {flightEndPos}!");
     }
 
     private void EndPoint(bool player1Scored, string banner)

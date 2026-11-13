@@ -27,8 +27,8 @@ public class RacketController : MonoBehaviour
     [SerializeField] private PongBall ball;
     [Tooltip("The BoxCollider on this racket used as the exact physical hit zone!")]
     public BoxCollider hitAreaBoxCollider;
-    [Tooltip("Small forgiveness padding (in meters) around the BoxCollider bounds. Set to 0 for strict exact box size!")]
-    [Range(0f, 0.35f)] public float hitBoxPadding = 0.06f;
+    [Tooltip("Small forgiveness padding (in meters) around the BoxCollider X/Z bounds.")]
+    [Range(0f, 0.40f)] public float hitBoxPadding = 0.12f;
     [SerializeField] private Transform myTargetCenter;
     [SerializeField] private Transform opponentTargetCenter;
     public Transform opponentRacketTransform;
@@ -82,7 +82,7 @@ public class RacketController : MonoBehaviour
         aiTrackSpeed = 5.5f;
         aiReactionDelay = 0.36f;
         maxTiltDegrees = 30f;
-        hitBoxPadding = 0.06f;
+        hitBoxPadding = 0.12f;
     }
 
     private void Awake()
@@ -107,7 +107,6 @@ public class RacketController : MonoBehaviour
             ball = FindFirstObjectByType<PongBall>();
         }
 
-        // Automatically find the BoxCollider you placed on player racket / enemy racket
         if (hitAreaBoxCollider == null)
         {
             hitAreaBoxCollider = GetComponent<BoxCollider>();
@@ -117,8 +116,6 @@ public class RacketController : MonoBehaviour
             }
         }
 
-        // Make sure the racket's BoxCollider is a trigger so it doesn't cause weird physics ricochets,
-        // while keeping its exact 3D bounds active for our hit detection!
         if (hitAreaBoxCollider != null)
         {
             hitAreaBoxCollider.enabled = true;
@@ -226,14 +223,14 @@ public class RacketController : MonoBehaviour
             {
                 aiCurrentReactionTimer = aiReactionDelay;
 
-                // AI occasionally misjudges heavy spin or fast shots
-                float spinPenalty = Mathf.Abs(ball.CurrentSpinMeter) * 0.18f;
-                aiTrackingErrorOffset = Random.Range(-0.18f - spinPenalty, 0.18f + spinPenalty);
+                // Small human-like tracking imperfection
+                float spinPenalty = Mathf.Abs(ball.CurrentSpinMeter) * 0.12f;
+                aiTrackingErrorOffset = Random.Range(-0.12f - spinPenalty, 0.12f + spinPenalty);
             }
             lastObservedPhase = ball.CurrentPhase;
         }
 
-        // 1. Calculate target horizontal movement FIRST
+        // 1. Update left/right movement offset
         UpdateHorizontalMovement();
 
         // 2. Calculate forward swing push
@@ -245,9 +242,7 @@ public class RacketController : MonoBehaviour
             currentForwardPush = Mathf.Sin(normalizedTime * Mathf.PI) * swingPushDistance;
         }
 
-        // 3. ACTUALLY MOVE THE RACKET TRANSFORM BEFORE CHECKING BOXCOLLIDER HIT!
-        // For AI, we move directly at aiTrackSpeed so the racket's physical position and BoxCollider
-        // genuinely reflect where the AI has reached—no fake teleporting or hitting from afar!
+        // 3. Move racket transform physically
         Vector3 targetWorldPos = homePosition
             + (tableRightAxis * currentHorizontalOffset)
             + (tableForwardAxis * currentForwardPush);
@@ -261,19 +256,18 @@ public class RacketController : MonoBehaviour
             transform.position = Vector3.Lerp(transform.position, targetWorldPos, moveSpeed * Time.deltaTime);
         }
 
-        // Sync physics transform so BoxCollider.bounds is 100% up-to-date this exact frame!
         Physics.SyncTransforms();
 
-        // 4. Tilt racket angle with Right Stick
+        // 4. Tilt racket angle
         UpdateManualTilt();
 
-        // 5. STATE: ServerReady -> Ball floats in front of Server's racket until [X] or [Y] is pressed
+        // 5. STATE: ServerReady -> Ball floats in front of Server's racket
         if (ball.CurrentPhase == RallyPhase.ServerReady && ball.IsPlayer1Serving == isPlayer1)
         {
             ball.SetupServe(isPlayer1, GetBallHoldPosition());
         }
 
-        // 6. Human Player Input: Press [X] (Slower Normal) or [Y] (Faster Smash)
+        // 6. Human Player Input
         if (controlType == RacketControlType.PlayerController && stateEntryIgnoreTimer <= 0f)
         {
             ShotType pressedShot = GetPlayerShotButton();
@@ -283,13 +277,13 @@ public class RacketController : MonoBehaviour
             }
         }
 
-        // 7. Beatable AI Behavior (Can ONLY swing and hit if its BoxCollider physically reaches the ball!)
+        // 7. Beatable AI Behavior
         if (controlType == RacketControlType.AI && stateEntryIgnoreTimer <= 0f)
         {
             HandleSmartAIBehavior();
         }
 
-        // 8. Check if an active swing's BoxCollider is currently touching the ball
+        // 8. Check if an active swing's BoxCollider is touching the ball
         if (activeSwingTimer > 0f && !hasStruckBallThisSwing && hitCooldown <= 0f)
         {
             TryExecuteStateMachineShot();
@@ -309,13 +303,11 @@ public class RacketController : MonoBehaviour
     }
 
     // =============================================================================================
-    // STRICT BOXCOLLIDER HIT AREA CHECK (Applies equally to BOTH Player and AI!)
-    // Checks:
-    // 1. Has the ball passed behind the front face of the racket/BoxCollider? If so -> FALSE!
-    // 2. Is the ball physically inside the BoxCollider bounds you placed on the racket?
-    //    If the AI (or Player) hasn't physically moved the BoxCollider to the ball -> FALSE!
+    // WORLD-SPACE BOXCOLLIDER HIT CHECK (Works even if you moved the BoxCollider above the table!)
+    // Optional parameter 'extraForwardReach' lets the AI know when the ball is close enough in front
+    // of the BoxCollider to START swinging forward so its BoxCollider pushes into the ball!
     // =============================================================================================
-    private bool IsBallInsideRacketBoxCollider()
+    private bool IsBallInsideRacketBoxCollider(float extraForwardReach = 0f)
     {
         if (ball == null) return false;
 
@@ -323,32 +315,45 @@ public class RacketController : MonoBehaviour
 
         if (hitAreaBoxCollider != null)
         {
-            // 1. Convert ball world position into the BoxCollider's local space so even rotated/tilted
-            //    BoxColliders are checked with 100% precision!
-            Vector3 localBallPos = hitAreaBoxCollider.transform.InverseTransformPoint(ballPos) - hitAreaBoxCollider.center;
-            Vector3 halfExtents = (hitAreaBoxCollider.size * 0.5f);
+            Bounds worldBounds = hitAreaBoxCollider.bounds;
+            Vector3 boxCenter = worldBounds.center;
 
-            // Convert world padding into local scale padding
-            Vector3 lossy = hitAreaBoxCollider.transform.lossyScale;
-            float padX = hitBoxPadding / Mathf.Max(0.01f, Mathf.Abs(lossy.x));
-            float padY = (hitBoxPadding + 0.15f) / Mathf.Max(0.01f, Mathf.Abs(lossy.y));
-            float padZ = hitBoxPadding / Mathf.Max(0.01f, Mathf.Abs(lossy.z));
+            // Measure distance from BoxCollider center along the table's Forward and Right axes
+            Vector3 diff = ballPos - boxCenter;
+            float forwardDist = Vector3.Dot(diff, tableForwardAxis);
+            float lateralDist = Mathf.Abs(Vector3.Dot(diff, tableRightAxis));
+            float verticalDist = Mathf.Abs(diff.y);
 
-            bool insideLocalBox =
-                Mathf.Abs(localBallPos.x) <= (halfExtents.x + padX) &&
-                Mathf.Abs(localBallPos.y) <= (halfExtents.y + padY) &&
-                Mathf.Abs(localBallPos.z) <= (halfExtents.z + padZ);
+            // Project world bounds extents onto the table axes so rotation never breaks it
+            float boxHalfForward =
+                Mathf.Abs(Vector3.Dot(Vector3.right * worldBounds.extents.x, tableForwardAxis)) +
+                Mathf.Abs(Vector3.Dot(Vector3.forward * worldBounds.extents.z, tableForwardAxis));
 
-            if (!insideLocalBox)
+            float boxHalfLateral =
+                Mathf.Abs(Vector3.Dot(Vector3.right * worldBounds.extents.x, tableRightAxis)) +
+                Mathf.Abs(Vector3.Dot(Vector3.forward * worldBounds.extents.z, tableRightAxis));
+
+            // 1. Strict Front-Face Law: Once the ball passes behind the back of the BoxCollider, it's missed!
+            if (forwardDist < -(boxHalfForward + 0.05f))
             {
                 return false;
             }
 
-            // 2. Strict Front-Face Law: Even if inside the box, once the ball's center passes behind
-            //    the center/back plane of the BoxCollider along tableForwardAxis, it's too late!
-            Vector3 boxWorldCenter = hitAreaBoxCollider.bounds.center;
-            float signedForwardDist = Vector3.Dot(ballPos - boxWorldCenter, tableForwardAxis);
-            if (signedForwardDist < -0.05f)
+            // 2. Must be within the forward reach of the BoxCollider
+            if (forwardDist > (boxHalfForward + hitBoxPadding + extraForwardReach))
+            {
+                return false;
+            }
+
+            // 3. Must be physically inside the left/right width of the BoxCollider!
+            //    If the AI (or Player) hasn't physically moved the BoxCollider to the ball's lane -> FALSE!
+            if (lateralDist > (boxHalfLateral + hitBoxPadding))
+            {
+                return false;
+            }
+
+            // 4. Generous vertical tolerance so moving the BoxCollider higher above the table still catches low bounces
+            if (verticalDist > (worldBounds.extents.y + 0.65f))
             {
                 return false;
             }
@@ -356,11 +361,11 @@ public class RacketController : MonoBehaviour
             return true;
         }
 
-        // Fallback ONLY if someone deleted the BoxCollider component off the racket
+        // Fallback if BoxCollider is missing
         Vector3 toBall = ballPos - transform.position;
-        float forwardDist = Vector3.Dot(toBall, tableForwardAxis);
-        float lateralDist = Mathf.Abs(Vector3.Dot(toBall, tableRightAxis));
-        return (forwardDist >= -0.02f && forwardDist <= 0.55f && lateralDist <= 0.35f);
+        float fDist = Vector3.Dot(toBall, tableForwardAxis);
+        float lDist = Mathf.Abs(Vector3.Dot(toBall, tableRightAxis));
+        return (fDist >= -0.05f && fDist <= (0.55f + extraForwardReach) && lDist <= 0.40f);
     }
 
     private void CalculateShotSpin(out float newSpinMeter, out SpinCategory category)
@@ -387,6 +392,28 @@ public class RacketController : MonoBehaviour
 
             newSpinMeter = Mathf.Clamp(baseSpin + Random.Range(-0.20f, 0.20f), -1f, 1f);
             category = newSpinMeter < 0f ? SpinCategory.SideSpinLeft : SpinCategory.SideSpinRight;
+        }
+    }
+
+    // Automatically determines which table target is THIS racket's side and which is the OPPONENT'S side
+    // by physical distance, so even if PlayerTargetCenter/EnemyTargetCenter are swapped, AI NEVER hits its own side!
+    private void GetVerifiedTableSides(out Vector3 mySideCenter, out Vector3 oppSideCenter)
+    {
+        Vector3 t1 = ball.GetPlayer1TableTarget();
+        Vector3 t2 = ball.GetPlayer2TableTarget();
+
+        float distToT1 = Vector3.Distance(homePosition, t1);
+        float distToT2 = Vector3.Distance(homePosition, t2);
+
+        if (distToT1 <= distToT2)
+        {
+            mySideCenter = t1;
+            oppSideCenter = t2;
+        }
+        else
+        {
+            mySideCenter = t2;
+            oppSideCenter = t1;
         }
     }
 
@@ -447,8 +474,7 @@ public class RacketController : MonoBehaviour
         float randomSpeedJitter = (controlType == RacketControlType.AI) ? Random.Range(0.92f, 1.06f) : 1.0f;
         float finalSpeedMult = (isSmash ? (shotForce * smashMultiplier) : shotForce) * randomSpeedJitter;
 
-        Vector3 myBaseCenter = isPlayer1 ? ball.GetPlayer1TableTarget() : ball.GetPlayer2TableTarget();
-        Vector3 oppBaseCenter = isPlayer1 ? ball.GetPlayer2TableTarget() : ball.GetPlayer1TableTarget();
+        GetVerifiedTableSides(out Vector3 myBaseCenter, out Vector3 oppBaseCenter);
 
         Vector3 receiverTargetPoint = CalculateRealisticReturnTarget(oppBaseCenter);
         CalculateShotSpin(out float shotSpin, out SpinCategory spinCat);
@@ -467,10 +493,10 @@ public class RacketController : MonoBehaviour
             return;
         }
 
-        // STATE B: RECEIVER STATE -> MUST BE PHYSICALLY INSIDE THE RACKET'S BOX COLLIDER!
+        // STATE B: RECEIVER STATE -> Must be physically inside the BoxCollider (or within active swing push reach)!
         if (ball.CurrentPhase == RallyPhase.ReceiverReadyToHit && ball.IsPlayer1Receiver == isPlayer1)
         {
-            if (IsBallInsideRacketBoxCollider())
+            if (IsBallInsideRacketBoxCollider(swingPushDistance * 0.65f))
             {
                 hasStruckBallThisSwing = true;
                 hitCooldown = 0.22f;
@@ -496,10 +522,11 @@ public class RacketController : MonoBehaviour
             return;
         }
 
-        // 2. AI Return: AI can ONLY trigger a return if the ball has physically entered its BoxCollider!
+        // 2. AI Return: If the AI has physically moved its BoxCollider into the ball's lateral lane
+        //    and the ball is entering the AI's forward swing reach, the AI swings forward to hit it!
         if (ball.CurrentPhase == RallyPhase.ReceiverReadyToHit && ball.IsPlayer1Receiver == isPlayer1)
         {
-            if (hitCooldown <= 0f && activeSwingTimer <= 0f && IsBallInsideRacketBoxCollider())
+            if (hitCooldown <= 0f && activeSwingTimer <= 0f && IsBallInsideRacketBoxCollider(swingPushDistance))
             {
                 ShotType aiRallyShot = (Random.value > 0.48f) ? ShotType.SmashShot : ShotType.NormalShot;
                 StartForwardRacketSwing(aiRallyShot);
@@ -517,21 +544,18 @@ public class RacketController : MonoBehaviour
                 return;
             }
 
-            // When ball is flying away from AI, return slowly toward center
             if (ball.IsPlayer1Receiver != isPlayer1)
             {
                 currentHorizontalOffset = Mathf.MoveTowards(currentHorizontalOffset, 0f, (aiTrackSpeed * 0.40f) * Time.deltaTime);
                 return;
             }
 
-            // AI waits for aiReactionDelay before it starts physically moving toward the ball!
             if (aiCurrentReactionTimer > 0f)
             {
                 aiCurrentReactionTimer -= Time.deltaTime;
                 return;
             }
 
-            // AI physically moves its racket toward the ball at aiTrackSpeed
             Vector3 offsetFromHome = ball.transform.position - homePosition;
             float ballRightDist = Vector3.Dot(offsetFromHome, tableRightAxis) + aiTrackingErrorOffset;
             float targetOffset = Mathf.Clamp(ballRightDist, -dynamicWidthLimit, dynamicWidthLimit);
@@ -613,7 +637,6 @@ public class RacketController : MonoBehaviour
         return Gamepad.current;
     }
 
-    // Draws the exact BoxCollider Hit Zone in the Scene View so you can see & size it visually!
     private void OnDrawGizmosSelected()
     {
         BoxCollider col = hitAreaBoxCollider != null ? hitAreaBoxCollider : GetComponentInChildren<BoxCollider>();
