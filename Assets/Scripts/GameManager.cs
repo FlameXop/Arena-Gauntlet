@@ -59,6 +59,9 @@ public class GameManager : Singleton<GameManager>
     private Gamepad p2Gamepad = null;
     private Coroutine pointTransitionRoutine;
 
+    // Prevents the [A] button press from ModeSelect from bleeding into ControllerSelect on the same frame!
+    private float stateInputCooldown = 0f;
+
     protected override void Awake()
     {
         base.Awake();
@@ -92,13 +95,18 @@ public class GameManager : Singleton<GameManager>
                 "<b><color=#00E5FF>XBOX CONTROLLER</color></b>\n" +
                 "<b>Move Racket:</b> Left Stick\n" +
                 "<b>Aim & Spin:</b> Right Stick\n" +
-                "<b>1. Toss Serve:</b> RB / LB (or A)\n" +
-                "<b>2. [X]</b> Normal Hit  |  <b>[Y]</b> Fast Smash";
+                "<b>[X]</b> Normal Hit  |  <b>[Y]</b> Fast Smash";
         }
     }
 
     private void Update()
     {
+        if (stateInputCooldown > 0f)
+        {
+            stateInputCooldown -= Time.unscaledDeltaTime;
+            return;
+        }
+
         if (CurrentState == GameState.MainMenu || CurrentState == GameState.ModeSelect)
         {
             EnsureControllerMenuSelection();
@@ -110,7 +118,15 @@ public class GameManager : Singleton<GameManager>
         }
         else if (CurrentState == GameState.ControllerSelect)
         {
+            // Keep UI EventSystem deselected in ControllerSelect so pressing [A] NEVER clicks a hidden UI button!
+            if (EventSystem.current != null && EventSystem.current.currentSelectedGameObject != null)
+            {
+                EventSystem.current.SetSelectedGameObject(null);
+            }
+
             PollControllersForSideSelect();
+
+            // Press [B] (buttonEast) to go back to Mode Select
             if (Gamepad.current != null && Gamepad.current.buttonEast.wasPressedThisFrame)
             {
                 ChangeState(GameState.ModeSelect);
@@ -154,6 +170,7 @@ public class GameManager : Singleton<GameManager>
         }
 
         CurrentState = newState;
+        stateInputCooldown = 0.20f; // 0.2s buffer so button presses don't carry over between screens!
 
         if (mainMenuPanel) mainMenuPanel.SetActive(newState == GameState.MainMenu);
         if (modeSelectPanel) modeSelectPanel.SetActive(newState == GameState.ModeSelect);
@@ -174,16 +191,29 @@ public class GameManager : Singleton<GameManager>
                 break;
 
             case GameState.ControllerSelect:
+                CurrentMode = GameMode.LocalPvP;
                 ResetSideSelection();
-                if (player1SideButton != null) SelectUIButton(player1SideButton.gameObject, sideSelectPanel);
+                // Deselect UI buttons so controller [A] only registers in PollControllersForSideSelect()!
+                if (EventSystem.current != null) EventSystem.current.SetSelectedGameObject(null);
                 break;
 
             case GameState.Playing:
                 if (menuVirtualCam) menuVirtualCam.SetActive(false);
                 if (player1VirtualCam) player1VirtualCam.SetActive(true);
 
-                if (CurrentMode == GameMode.LocalPvP) EnableSplitScreen();
-                else ResetSplitScreen();
+                if (CurrentMode == GameMode.LocalPvP)
+                {
+                    EnableSplitScreen();
+                    // Force both rackets to PlayerController in Local PvP!
+                    player1Racket.isPlayer1 = true;
+                    player2Racket.isPlayer1 = false;
+                    player1Racket.ConfigureControl(RacketControlType.PlayerController, mainCameraP1, p1Gamepad);
+                    player2Racket.ConfigureControl(RacketControlType.PlayerController, splitScreenCamP2, p2Gamepad);
+                }
+                else
+                {
+                    ResetSplitScreen();
+                }
 
                 SetupNextPointServe();
                 break;
@@ -201,6 +231,9 @@ public class GameManager : Singleton<GameManager>
 
     public void OnSelectAIMode()
     {
+        // Ignore accidental UI click if we are already in ControllerSelect!
+        if (CurrentState == GameState.ControllerSelect) return;
+
         CurrentMode = GameMode.SinglePlayerAI;
         Gamepad pad = Gamepad.current != null ? Gamepad.current : (Gamepad.all.Count > 0 ? Gamepad.all[0] : null);
 
@@ -232,25 +265,28 @@ public class GameManager : Singleton<GameManager>
         if (player2ButtonText) player2ButtonText.text = "Player 2\n<size=60%>Press [A] on Controller 2</size>";
     }
 
+    // Allows clicking with Mouse as well
     public void OnPlayer1SideButtonClicked()
     {
-        if (p1Joined) return;
+        if (CurrentState != GameState.ControllerSelect || p1Joined) return;
         Gamepad pad = Gamepad.current != null && Gamepad.current != p2Gamepad ? Gamepad.current : null;
-        LockInPlayer1(pad, pad != null ? $"Controller ({pad.displayName})" : "Controller 1");
+        LockInPlayer1(pad, pad != null ? $"Controller 1" : "Player 1 Ready");
     }
 
     public void OnPlayer2SideButtonClicked()
     {
-        if (p2Joined) return;
+        if (CurrentState != GameState.ControllerSelect || p2Joined) return;
         Gamepad pad = Gamepad.current != null && Gamepad.current != p1Gamepad ? Gamepad.current : null;
-        LockInPlayer2(pad, pad != null ? $"Controller ({pad.displayName})" : "Controller 2");
+        LockInPlayer2(pad, pad != null ? $"Controller 2" : "Player 2 Ready");
     }
 
     private void PollControllersForSideSelect()
     {
+        // 1. Check connected Gamepads
         foreach (Gamepad pad in Gamepad.all)
         {
-            if (pad.buttonSouth.wasPressedThisFrame || pad.startButton.wasPressedThisFrame)
+            // Press [A] on a controller to lock in P1 (or P2 if using a 2nd controller)
+            if (pad.buttonSouth.wasPressedThisFrame)
             {
                 if (!p1Joined && pad != p2Gamepad)
                 {
@@ -263,17 +299,66 @@ public class GameManager : Singleton<GameManager>
                     return;
                 }
             }
+
+            // SOLO TEST SHORTCUT ON CONTROLLER:
+            // If P1 is already ready, press [X] or [Y] on Controller 1 to force-join Player 2!
+            if (p1Joined && !p2Joined && (pad.buttonWest.wasPressedThisFrame || pad.buttonNorth.wasPressedThisFrame))
+            {
+                LockInPlayer2(null, "Keyboard / Test P2");
+                return;
+            }
+
+            // Once both are ready, press [START] on controller to launch Split-Screen
+            if (p1Joined && p2Joined && pad.startButton.wasPressedThisFrame)
+            {
+                BeginPvPMatch();
+                return;
+            }
+        }
+
+        // 2. Check Keyboard so you can join P2 and start Split-Screen without a 2nd controller!
+        if (Keyboard.current != null)
+        {
+            bool keyPressed = Keyboard.current.spaceKey.wasPressedThisFrame ||
+                              Keyboard.current.enterKey.wasPressedThisFrame ||
+                              Keyboard.current.numpadEnterKey.wasPressedThisFrame;
+
+            if (keyPressed)
+            {
+                if (!p1Joined)
+                {
+                    LockInPlayer1(null, "Keyboard P1");
+                    return;
+                }
+                else if (!p2Joined)
+                {
+                    // First press when P1 is ready -> Locks in Player 2!
+                    LockInPlayer2(null, "Keyboard P2");
+                    return;
+                }
+                else
+                {
+                    // Second press when both P1 & P2 are ready -> Starts the Split-Screen match!
+                    BeginPvPMatch();
+                    return;
+                }
+            }
         }
     }
-
     private void LockInPlayer1(Gamepad pad, string label)
     {
         p1Joined = true;
         p1Gamepad = pad;
         player1Racket.isPlayer1 = true;
         player1Racket.ConfigureControl(RacketControlType.PlayerController, mainCameraP1, pad);
-        if (player1ButtonText) player1ButtonText.text = $"<color=#00FF88>P1 READY</color>\n<size=55%>{label}</size>";
-        CheckBothPlayersReady();
+
+        if (player1ButtonText)
+        {
+            player1ButtonText.text = p2Joined
+                ? $"<color=#00FF88>P1 READY</color>\n<size=55%>Press [START] to Play!</size>"
+                : $"<color=#00FF88>P1 READY</color>\n<size=55%>{label}</size>";
+        }
+        UpdateStartPromptOnButtons();
     }
 
     private void LockInPlayer2(Gamepad pad, string label)
@@ -282,21 +367,31 @@ public class GameManager : Singleton<GameManager>
         p2Gamepad = pad;
         player2Racket.isPlayer1 = false;
         player2Racket.ConfigureControl(RacketControlType.PlayerController, splitScreenCamP2, pad);
-        if (player2ButtonText) player2ButtonText.text = $"<color=#00FF88>P2 READY</color>\n<size=55%>{label}</size>";
-        CheckBothPlayersReady();
+
+        if (player2ButtonText)
+        {
+            player2ButtonText.text = $"<color=#00FF88>P2 READY</color>\n<size=55%>{label}</size>";
+        }
+        UpdateStartPromptOnButtons();
     }
 
-    private void CheckBothPlayersReady()
+    private void UpdateStartPromptOnButtons()
     {
         if (p1Joined && p2Joined)
         {
-            p1Score = 0; p2Score = 0;
-            UpdateScoreUI();
-            Invoke(nameof(BeginPvPMatch), 0.4f);
+            if (player1ButtonText) player1ButtonText.text = "<color=#00FF88>P1 READY</color>\n<size=55%>Press [START] to Begin!</size>";
+            if (player2ButtonText) player2ButtonText.text = "<color=#00FF88>P2 READY</color>\n<size=55%>Press [START] to Begin!</size>";
         }
     }
 
-    private void BeginPvPMatch() => ChangeState(GameState.Playing);
+    public void BeginPvPMatch()
+    {
+        CurrentMode = GameMode.LocalPvP;
+        p1Score = 0;
+        p2Score = 0;
+        UpdateScoreUI();
+        ChangeState(GameState.Playing);
+    }
 
     private bool IsPlayer1TurnToServe()
     {
@@ -316,7 +411,6 @@ public class GameManager : Singleton<GameManager>
         UpdateScoreUI();
     }
 
-    // Supports an optional feedback banner (e.g., "NET FAULT!", "OUT OF BOUNDS!") and waits before resetting!
     public void OnPointScored(bool player1Scored, string reasonBanner = "")
     {
         if (CurrentState != GameState.Playing || pointTransitionRoutine != null) return;

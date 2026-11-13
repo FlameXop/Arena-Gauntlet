@@ -629,11 +629,13 @@ public class RacketController : MonoBehaviour
     private Gamepad GetActiveGamepad()
     {
         if (assignedGamepad != null) return assignedGamepad;
+
         if (GameManager.Instance != null && GameManager.Instance.CurrentMode == GameMode.LocalPvP)
         {
             int index = isPlayer1 ? 0 : 1;
-            if (Gamepad.all.Count > index) return Gamepad.all[index];
+            return Gamepad.all.Count > index ? Gamepad.all[index] : null;
         }
+
         return Gamepad.current;
     }
 
