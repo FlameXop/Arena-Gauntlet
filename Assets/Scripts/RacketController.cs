@@ -19,9 +19,11 @@ public class RacketController : MonoBehaviour
     [SerializeField] private float safeSpawnForwardDistance = 0.35f;
     [SerializeField] private float safeSpawnUpOffset = 0.25f;
 
-    [Header("2. Shot Speed Settings")]
-    [Range(0.8f, 1.5f)] public float shotForce = 1.05f;
-    [Range(1.1f, 1.5f)] public float smashMultiplier = 1.25f;
+    [Header("2. Shot Speed Settings (Tuned Slower!)")]
+    [Tooltip("Base speed multiplier (1.0 = exact PongBall timings)")]
+    [Range(0.8f, 1.3f)] public float shotForce = 1.0f;
+    [Tooltip("Smash uses PongBall's smashCrossNetTime (0.52s)")]
+    [Range(1.0f, 1.3f)] public float smashMultiplier = 1.0f;
 
     [Header("3. References")]
     [SerializeField] private PongBall ball;
@@ -31,9 +33,9 @@ public class RacketController : MonoBehaviour
 
     [Header("4. Swing & Movement Settings")]
     [SerializeField] private float swingPushDistance = 0.45f;
-    [SerializeField] private float swingDuration = 0.28f;
-    [SerializeField] private float moveSpeed = 18f;
-    [SerializeField] private float aiTrackSpeed = 15f;
+    [SerializeField] private float swingDuration = 0.32f;
+    [SerializeField] private float moveSpeed = 16f;
+    [SerializeField] private float aiTrackSpeed = 11f;
     [SerializeField] private float maxTiltDegrees = 30f;
 
     private Gamepad assignedGamepad;
@@ -43,8 +45,10 @@ public class RacketController : MonoBehaviour
     private Vector3 tableForwardAxis;
     private Vector3 tableRightAxis;
 
+    // Auto-scaled to match your table mesh dimensions
     private float dynamicWidthLimit = 0.85f;
-    private float dynamicSpreadWidth = 0.45f;
+    private float safeTableBounceMargin = 0.68f;
+    private float maxLateralReach = 0.58f;
 
     private float currentHorizontalOffset = 0f;
     private float currentTiltInput = 0f;
@@ -64,12 +68,13 @@ public class RacketController : MonoBehaviour
         homePosition = transform.position;
         baseRotation = transform.rotation;
 
-        shotForce = 1.05f;
-        smashMultiplier = 1.25f;
+        // Lock clean speed multipliers so PongBall's exact durations control X and Y speeds
+        shotForce = 1.0f;
+        smashMultiplier = 1.0f;
         swingPushDistance = 0.45f;
-        swingDuration = 0.28f;
-        moveSpeed = 18f;
-        aiTrackSpeed = 15f;
+        swingDuration = 0.32f;
+        moveSpeed = 16f;
+        aiTrackSpeed = 11f;
 
         AutoFindMissingReferences();
         ComputeTableAxes();
@@ -122,10 +127,10 @@ public class RacketController : MonoBehaviour
             tableForwardAxis = dirToOpponent.normalized;
             tableRightAxis = Vector3.Cross(Vector3.up, tableForwardAxis).normalized;
 
-            // Automatically scale paddle movement width & aim spread to match the table size in your scene
             float halfLen = ball != null ? ball.GetTableHalfDistance() : (dirToOpponent.magnitude * 0.24f);
-            dynamicWidthLimit = Mathf.Max(0.65f, halfLen * 0.75f);
-            dynamicSpreadWidth = Mathf.Max(0.35f, halfLen * 0.42f);
+            dynamicWidthLimit = Mathf.Max(0.75f, halfLen * 0.82f);
+            safeTableBounceMargin = dynamicWidthLimit * 0.82f; // Keeps random bounces well inside table edges
+            maxLateralReach = Mathf.Max(0.48f, dynamicWidthLimit * 0.58f); // Player must move left/right to reach!
             return;
         }
 
@@ -133,7 +138,6 @@ public class RacketController : MonoBehaviour
         tableRightAxis = Vector3.Cross(Vector3.up, tableForwardAxis).normalized;
     }
 
-    // Holds the ball visibly in front of the Server's paddle above the table surface
     public Vector3 GetBallHoldPosition()
     {
         ComputeTableAxes();
@@ -191,7 +195,7 @@ public class RacketController : MonoBehaviour
             ball.SetupServe(isPlayer1, GetBallHoldPosition());
         }
 
-        // 3. Human Player Input: Press [X] (Normal) or [Y] (Smash)
+        // 3. Human Player Input: Press [X] (Slower Normal) or [Y] (Faster Smash)
         if (controlType == RacketControlType.PlayerController && stateEntryIgnoreTimer <= 0f)
         {
             ShotType pressedShot = GetPlayerShotButton();
@@ -201,7 +205,7 @@ public class RacketController : MonoBehaviour
             }
         }
 
-        // 4. Smart AI Behavior (Serves & Returns)
+        // 4. Smart AI Behavior (Serves & Returns with random X or Y speed!)
         if (controlType == RacketControlType.AI && stateEntryIgnoreTimer <= 0f)
         {
             HandleSmartAIBehavior();
@@ -243,22 +247,87 @@ public class RacketController : MonoBehaviour
         }
     }
 
+    // =============================================================================================
+    // REALISTIC POSITIONAL + RANDOM ZONE TARGETING
+    // Example: If you are on the right edge, it starts from the point directly in front of you
+    // on the right and picks a realistic spot between your lane and a random 4-5 unit spread inward/outward,
+    // forcing the opponent to move left or right instead of standing still in the middle!
+    // =============================================================================================
+    private Vector3 CalculateRealisticReturnTarget(Vector3 oppBaseCenter)
+    {
+        // 1. World-space lateral position of this racket relative to the center line of the table
+        float myLateralFromCenter = Vector3.Dot(transform.position - oppBaseCenter, tableRightAxis);
+        myLateralFromCenter = Mathf.Clamp(myLateralFromCenter, -safeTableBounceMargin, safeTableBounceMargin);
+
+        // 2. Define a realistic target window anchored around the point directly in front of the hitter
+        // If you are near an edge, the window naturally expands toward the open side of the table
+        // while keeping the point directly in front of you as one side of the range!
+        float spreadRadius = safeTableBounceMargin * 0.72f; // Realistic 4-5 unit style spread zone
+
+        float minBound;
+        float maxBound;
+
+        if (Mathf.Abs(myLateralFromCenter) > safeTableBounceMargin * 0.35f)
+        {
+            // Hitter is on the Left or Right side:
+            // Pick any point between directly in front of the hitter and a realistic spread toward the middle/other side!
+            float inwardTarget = myLateralFromCenter - Mathf.Sign(myLateralFromCenter) * spreadRadius * 1.15f;
+            float outwardEdge = myLateralFromCenter + Mathf.Sign(myLateralFromCenter) * (spreadRadius * 0.25f);
+
+            minBound = Mathf.Min(myLateralFromCenter, inwardTarget, outwardEdge);
+            maxBound = Mathf.Max(myLateralFromCenter, inwardTarget, outwardEdge);
+        }
+        else
+        {
+            // Hitter is near the middle: spread left or right by spreadRadius so the receiver MUST move!
+            minBound = myLateralFromCenter - spreadRadius;
+            maxBound = myLateralFromCenter + spreadRadius;
+
+            // Nudge away from dead-center (0) so rallies don't stay stuck middle-to-middle
+            if (controlType == RacketControlType.AI && Random.value > 0.25f)
+            {
+                float sideSign = Random.value > 0.5f ? 1f : -1f;
+                minBound = sideSign > 0f ? (spreadRadius * 0.30f) : -spreadRadius;
+                maxBound = sideSign > 0f ? spreadRadius : (-spreadRadius * 0.30f);
+            }
+        }
+
+        // Optional Right-Stick influence for human player
+        if (controlType == RacketControlType.PlayerController && Mathf.Abs(currentTiltInput) > 0.15f)
+        {
+            float tiltShift = currentTiltInput * (spreadRadius * 0.45f);
+            minBound += tiltShift;
+            maxBound += tiltShift;
+        }
+
+        // Clamp strictly inside the table boundaries so normal shots never fly off the sides
+        minBound = Mathf.Clamp(minBound, -safeTableBounceMargin, safeTableBounceMargin);
+        maxBound = Mathf.Clamp(maxBound, -safeTableBounceMargin, safeTableBounceMargin);
+
+        float chosenLateralOffset = Random.Range(minBound, maxBound);
+
+        // 3. Add realistic depth variation (short vs. deep bounce on opponent's half)
+        float depthVariation = Random.Range(-0.18f, 0.22f) * (ball != null ? ball.GetTableHalfDistance() : 0.8f);
+
+        return oppBaseCenter
+            + (tableRightAxis * chosenLateralOffset)
+            + (tableForwardAxis * depthVariation);
+    }
+
     private void TryExecuteStateMachineShot()
     {
         if (ball == null || hitCooldown > 0f) return;
 
         bool isSmash = (activeSwingShot == ShotType.SmashShot);
-        float finalSpeedMult = isSmash ? (shotForce * smashMultiplier) : shotForce;
 
-        // Calculate aim target on opponent's half of the table
-        float aimSpread = (controlType == RacketControlType.AI)
-            ? Random.Range(-dynamicSpreadWidth * 0.75f, dynamicSpreadWidth * 0.75f)
-            : Mathf.Clamp((currentTiltInput * 0.75f + (currentHorizontalOffset / dynamicWidthLimit) * 0.25f) * dynamicSpreadWidth, -dynamicSpreadWidth, dynamicSpreadWidth);
+        // AI gets a slight natural speed variation (0.94x to 1.06x) on top of choosing X or Y
+        float randomSpeedJitter = (controlType == RacketControlType.AI) ? Random.Range(0.94f, 1.06f) : 1.0f;
+        float finalSpeedMult = (isSmash ? (shotForce * smashMultiplier) : shotForce) * randomSpeedJitter;
 
         Vector3 myBaseCenter = isPlayer1 ? ball.GetPlayer1TableTarget() : ball.GetPlayer2TableTarget();
         Vector3 oppBaseCenter = isPlayer1 ? ball.GetPlayer2TableTarget() : ball.GetPlayer1TableTarget();
 
-        Vector3 receiverTargetPoint = oppBaseCenter + (tableRightAxis * aimSpread);
+        Vector3 receiverTargetPoint = CalculateRealisticReturnTarget(oppBaseCenter);
         Vector3 spin = Vector3.up * (-currentTiltInput * 25f);
 
         // =========================================================================
@@ -267,50 +336,62 @@ public class RacketController : MonoBehaviour
         if (ball.CurrentPhase == RallyPhase.ServerReady && ball.IsPlayer1Serving == isPlayer1)
         {
             hasStruckBallThisSwing = true;
-            hitCooldown = 0.20f;
+            hitCooldown = 0.22f;
 
-            Vector3 ownBounceSpot = myBaseCenter + (tableRightAxis * (currentHorizontalOffset * 0.35f));
+            // Server's first bounce is right in front of where the Server is standing!
+            float serverLat = Vector3.Dot(transform.position - myBaseCenter, tableRightAxis);
+            serverLat = Mathf.Clamp(serverLat, -safeTableBounceMargin, safeTableBounceMargin);
+            Vector3 ownBounceSpot = myBaseCenter + (tableRightAxis * serverLat);
+
             ball.ExecuteServerDownwardHit(ownBounceSpot, receiverTargetPoint, finalSpeedMult, isSmash, spin, isPlayer1);
             return;
         }
 
         // =========================================================================
-        // STATE B: RECEIVER STATE (Once ball bounces on Receiver's side, hit it back over net!)
+        // STATE B: RECEIVER STATE (Must move left/right to the ball's lane to hit it!)
         // =========================================================================
         if (ball.CurrentPhase == RallyPhase.ReceiverReadyToHit && ball.IsPlayer1Receiver == isPlayer1)
         {
-            hasStruckBallThisSwing = true;
-            hitCooldown = 0.20f;
+            // Check how far left/right the ball is from the player's racket
+            float lateralDistToBall = Mathf.Abs(Vector3.Dot(ball.transform.position - transform.position, tableRightAxis));
 
-            string label = isSmash ? "Y-SMASH" : "X-NORMAL";
-            ball.ExecuteReceiverRallyReturn(receiverTargetPoint, finalSpeedMult, isSmash, spin, isPlayer1, label);
+            // Player MUST move toward the ball's left/right position (standing in middle won't hit wide shots!)
+            if (lateralDistToBall <= maxLateralReach || controlType == RacketControlType.AI)
+            {
+                hasStruckBallThisSwing = true;
+                hitCooldown = 0.22f;
+
+                string label = isSmash ? "Y-FAST" : "X-SLOW";
+                ball.ExecuteReceiverRallyReturn(receiverTargetPoint, finalSpeedMult, isSmash, spin, isPlayer1, label);
+            }
         }
     }
 
     private void HandleSmartAIBehavior()
     {
-        // 1. AI SERVER: Waits 0.65s so you see the ball ready, then serves down onto AI's own side
+        // 1. AI SERVER: Waits 0.70s, moves slightly left/right, and randomly serves with [X] Slow or [Y] Fast
         if (ball.CurrentPhase == RallyPhase.ServerReady && ball.IsPlayer1Serving == isPlayer1)
         {
             aiServeTimer += Time.deltaTime;
-            if (aiServeTimer >= 0.65f)
+            if (aiServeTimer >= 0.70f)
             {
                 aiServeTimer = 0f;
-                ShotType aiServeShot = (Random.value > 0.45f) ? ShotType.SmashShot : ShotType.NormalShot;
+                ShotType aiServeShot = (Random.value > 0.50f) ? ShotType.SmashShot : ShotType.NormalShot;
                 StartForwardRacketSwing(aiServeShot);
             }
             return;
         }
 
-        // 2. AI RECEIVER: Once ball bounces on AI's table and glides near AI's paddle, AI returns it
+        // 2. AI RECEIVER: Tracks ball and returns with random [X] Slow or [Y] Fast speed
         if (ball.CurrentPhase == RallyPhase.ReceiverReadyToHit && ball.IsPlayer1Receiver == isPlayer1)
         {
             float distAlongTable = Mathf.Abs(Vector3.Dot(ball.transform.position - homePosition, tableForwardAxis));
-            float maxReach = Mathf.Max(1.2f, ball.GetTableHalfDistance() * 0.85f);
+            float maxReach = Mathf.Max(1.1f, ball.GetTableHalfDistance() * 0.85f);
 
             if (hitCooldown <= 0f && activeSwingTimer <= 0f && distAlongTable <= maxReach)
             {
-                ShotType aiRallyShot = (Random.value > 0.50f) ? ShotType.SmashShot : ShotType.NormalShot;
+                // AI randomly mixes up X (Slower) and Y (Faster) returns!
+                ShotType aiRallyShot = (Random.value > 0.45f) ? ShotType.SmashShot : ShotType.NormalShot;
                 StartForwardRacketSwing(aiRallyShot);
             }
         }
@@ -322,7 +403,7 @@ public class RacketController : MonoBehaviour
         {
             if (ball.CurrentPhase == RallyPhase.ServerReady)
             {
-                currentHorizontalOffset = Mathf.MoveTowards(currentHorizontalOffset, 0f, Time.deltaTime * 5f);
+                currentHorizontalOffset = Mathf.MoveTowards(currentHorizontalOffset, 0f, Time.deltaTime * 4f);
                 return;
             }
 
@@ -380,8 +461,8 @@ public class RacketController : MonoBehaviour
         Gamepad pad = GetActiveGamepad();
         if (pad != null)
         {
-            if (pad.buttonWest.wasPressedThisFrame) return ShotType.NormalShot;  // [X] = Normal Shot
-            if (pad.buttonNorth.wasPressedThisFrame) return ShotType.SmashShot;  // [Y] = Fast Smash
+            if (pad.buttonWest.wasPressedThisFrame) return ShotType.NormalShot;  // [X] = Slower Normal Shot
+            if (pad.buttonNorth.wasPressedThisFrame) return ShotType.SmashShot;  // [Y] = Faster Smash Shot
         }
 
         if (Keyboard.current != null)
