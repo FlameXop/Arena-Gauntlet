@@ -170,7 +170,6 @@ public class PongBall : MonoBehaviour
         halfTableDist = Mathf.Max(0.6f, totalRacketDist * 0.24f);
     }
 
-    // Guaranteed to return the table half closest to Player 1's racket!
     public Vector3 GetPlayer1TableTarget()
     {
         Vector3 mathP1 = tableCenterPos - (axisP1ToP2 * halfTableDist);
@@ -184,7 +183,6 @@ public class PongBall : MonoBehaviour
         return mathP1;
     }
 
-    // Guaranteed to return the table half closest to Player 2 / AI's racket!
     public Vector3 GetPlayer2TableTarget()
     {
         Vector3 mathP2 = tableCenterPos + (axisP1ToP2 * halfTableDist);
@@ -228,6 +226,11 @@ public class PongBall : MonoBehaviour
                 postPointVelocity.y = Mathf.Abs(postPointVelocity.y) * 0.52f;
                 postPointVelocity.x *= 0.72f;
                 postPointVelocity.z *= 0.72f;
+
+                if (AudioManager.Instance != null && postPointVelocity.y > 0.5f)
+                {
+                    AudioManager.Instance.PlayTableBounce();
+                }
             }
             return;
         }
@@ -237,8 +240,6 @@ public class PongBall : MonoBehaviour
 
         transform.position = EvaluateFlightPosition(t);
 
-        // Only trigger a fault once the ball has actually passed BEHIND the Receiver's racket plane
-        // or finished its full pop-up window without being returned!
         if (CurrentPhase == RallyPhase.ReceiverReadyToHit)
         {
             Vector3 receiverHome = IsPlayer1Receiver ? p1RacketHome : p2RacketHome;
@@ -246,7 +247,6 @@ public class PongBall : MonoBehaviour
 
             float distInFrontOfReceiverHome = Vector3.Dot(transform.position - receiverHome, receiverForward);
 
-            // Once the ball has traveled 0.18m past the back of the receiver's home line, they missed it!
             if (distInFrontOfReceiverHome < -0.18f)
             {
                 TriggerReceiverFault(false);
@@ -308,6 +308,11 @@ public class PongBall : MonoBehaviour
     private void TriggerReceiverFault(bool isDoubleBounce)
     {
         if (CurrentPhase == RallyPhase.PointEnded) return;
+
+        if (isDoubleBounce && AudioManager.Instance != null)
+        {
+            AudioManager.Instance.PlayTableBounce();
+        }
 
         string hitter = LastHitByPlayer1 ? "P1" : "P2/AI";
         string receiver = LastHitByPlayer1 ? "P2/AI" : "P1";
@@ -387,12 +392,24 @@ public class PongBall : MonoBehaviour
         flightElapsed = 0f;
         flightIsSmash = isSmash;
 
+        // Play Racket Serve Hit SFX!
+        if (AudioManager.Instance != null)
+        {
+            AudioManager.Instance.PlayRacketHit(isSmash);
+        }
+
         if (enableDebugLogs)
             Debug.Log($"<color=#00E5FF>[1. SERVE DOWN]</color> {(hitByP1 ? "P1" : "P2/AI")} served to own side {flightEndPos} -> Target {pendingServeReceiverSpot}");
     }
 
     private void TriggerServeFirstBounceOverNet()
     {
+        // Play Table Bounce SFX on Server's own side!
+        if (AudioManager.Instance != null)
+        {
+            AudioManager.Instance.PlayTableBounce();
+        }
+
         CurrentPhase = RallyPhase.CrossingToReceiver;
 
         flightStartPos = flightEndPos;
@@ -407,12 +424,14 @@ public class PongBall : MonoBehaviour
         flightIsSmash = pendingServeIsSmash;
     }
 
-    // =========================================================================================
-    // CRITICAL FIX: Ensures the ball pops up from the table and travels ALL THE WAY through
-    // the Receiver's BoxCollider plane (both Player 1 and AI) at BoxCollider height!
-    // =========================================================================================
     private void TriggerReceiverTableBounce()
     {
+        // Play Table Bounce SFX on Receiver's side!
+        if (AudioManager.Instance != null)
+        {
+            AudioManager.Instance.PlayTableBounce();
+        }
+
         CurrentPhase = RallyPhase.ReceiverReadyToHit;
 
         flightStartPos = flightEndPos;
@@ -420,7 +439,6 @@ public class PongBall : MonoBehaviour
         Vector3 receiverHome = IsPlayer1Receiver ? p1RacketHome : p2RacketHome;
         Vector3 dirToReceiver = IsPlayer1Receiver ? -axisP1ToP2 : axisP1ToP2;
 
-        // Exact distance from table center to the Receiver's racket home line (plus 0.22m past it)
         float distCenterToRacket = Mathf.Abs(Vector3.Dot(receiverHome - tableCenterPos, dirToReceiver));
         float targetReachDist = Mathf.Max(halfTableDist * 2.05f, distCenterToRacket + 0.22f);
 
@@ -432,7 +450,6 @@ public class PongBall : MonoBehaviour
             + (lateralOffset * 1.05f)
             + spinBounceKick;
 
-        // End at a natural height near the table surface right behind the racket so it passes straight through the BoxCollider!
         passThroughRacketSpot.y = tableSurfaceY + 0.10f;
 
         flightEndPos = passThroughRacketSpot;
@@ -467,6 +484,12 @@ public class PongBall : MonoBehaviour
         flightDuration = baseTime / clampedSpeed;
         flightElapsed = 0f;
         flightIsSmash = isSmash;
+
+        // Play Racket Rally Return Hit SFX!
+        if (AudioManager.Instance != null)
+        {
+            AudioManager.Instance.PlayRacketHit(isSmash);
+        }
 
         if (enableDebugLogs)
             Debug.Log($"<color=#00E5FF>[RALLY RETURN - {shotLabel}]</color> {(hitByP1 ? "P1" : "P2/AI")} returned to {flightEndPos}!");

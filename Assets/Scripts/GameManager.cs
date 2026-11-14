@@ -65,6 +65,10 @@ public class GameManager : Singleton<GameManager>
     protected override void Awake()
     {
         base.Awake();
+        // 1. Unlock FPS & match the 144Hz monitor's native refresh rate in builds!
+        QualitySettings.vSyncCount = 1; // Syncs cleanly to 144Hz without screen tearing
+        Application.targetFrameRate = 144;
+        Screen.SetResolution(1920, 1080, FullScreenMode.FullScreenWindow, Screen.currentResolution.refreshRateRatio);
         if (splitScreenCamP2 != null) splitScreenCamP2.gameObject.SetActive(false);
         if (mainMenuPanel) mainMenuPanel.SetActive(false);
         if (modeSelectPanel) modeSelectPanel.SetActive(false);
@@ -172,6 +176,22 @@ public class GameManager : Singleton<GameManager>
         CurrentState = newState;
         stateInputCooldown = 0.20f; // 0.2s buffer so button presses don't carry over between screens!
 
+        // =========================================================================
+        // BACKGROUND MUSIC CONTROL:
+        // - Plays automatically after Loading screen (MainMenu, ModeSelect, ControllerSelect)
+        // - STOPS immediately when the match starts (GameState.Playing)!
+        // =========================================================================
+        if (newState == GameState.MainMenu || newState == GameState.ModeSelect || newState == GameState.ControllerSelect)
+        {
+            if (AudioManager.Instance != null) AudioManager.Instance.StartBackgroundMusic();
+            if (bgmSource != null && !bgmSource.isPlaying) bgmSource.Play();
+        }
+        else if (newState == GameState.Playing)
+        {
+            if (AudioManager.Instance != null) AudioManager.Instance.StopBackgroundMusic();
+            if (bgmSource != null && bgmSource.isPlaying) bgmSource.Stop();
+        }
+
         if (mainMenuPanel) mainMenuPanel.SetActive(newState == GameState.MainMenu);
         if (modeSelectPanel) modeSelectPanel.SetActive(newState == GameState.ModeSelect);
         if (sideSelectPanel) sideSelectPanel.SetActive(newState == GameState.ControllerSelect);
@@ -226,7 +246,13 @@ public class GameManager : Singleton<GameManager>
 
     // --- UI BUTTON HOOKS ---
     public void OnPlayButtonPressed() => ChangeState(GameState.ModeSelect);
-    public void OnToggleMusicPressed() { if (bgmSource != null) bgmSource.mute = !bgmSource.mute; }
+
+    public void OnToggleMusicPressed()
+    {
+        if (AudioManager.Instance != null) AudioManager.Instance.ToggleMuteMusic();
+        if (bgmSource != null) bgmSource.mute = !bgmSource.mute;
+    }
+
     public void OnExitButtonPressed() => Application.Quit();
 
     public void OnSelectAIMode()
@@ -345,6 +371,7 @@ public class GameManager : Singleton<GameManager>
             }
         }
     }
+
     private void LockInPlayer1(Gamepad pad, string label)
     {
         p1Joined = true;
